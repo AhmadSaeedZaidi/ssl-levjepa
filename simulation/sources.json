@@ -1,0 +1,18 @@
+{
+  "sumatra": {
+    "repository": "https://github.com/TIGERs-Mannheim/Sumatra.git",
+    "commit": "0bb4c653ef8611f9e71a880165f101209be97b3c",
+    "release": "2025",
+    "binary_url": "https://github.com/TIGERs-Mannheim/Sumatra/releases/download/2025/sumatra.zip",
+    "binary_sha256": "262a8355112464c70ebcf5de6bf895039cef73706b3383c9b7d5aa7b13023b37"
+  },
+  "inspected_alternatives": {
+    "erforce_repository": "https://github.com/robotics-erlangen/framework",
+    "erforce_commit": "38563d11879b4b8dd4ee8009b1d49cc88fae8abf",
+    "erforce_image": "roboticserlangen/simulatorcli@sha256:19d0df91697c82ebfd1f86eca5ccf6b8be2f0d64b22078725257c3a5856b5ddc",
+    "erforce_image_build_date": "2022-04-20; not asserted to match the inspected source commit",
+    "grsim_repository": "https://github.com/RoboCup-SSL/grSim",
+    "grsim_commit": "fe2bd2915a46f9f11ea6cb48dc426b8047952073",
+    "simulation_protocol_commit": "65ad6148671a2b1ead58be0b625ca0f8d269ced8"
+  }
+}

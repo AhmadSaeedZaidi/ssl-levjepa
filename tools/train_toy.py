@@ -92,6 +92,7 @@ class Measurements(pl.Callback):
             if self.grad_norm is None:
                 raise RuntimeError("Optimizer hook did not record gradients")
         row = {"optimizer_step": trainer.global_step, "loss": self.loss,
+               "unix_time": time.time(),
                "gradient_norm": self.grad_norm, "wall_elapsed_sec": now-self.started,
                "compute_sec": now-self.batch_started, "data_wait_sec": batch["data_wait_sec"],
                "clips": int(batch["clip"].shape[0]), "peak_allocated_bytes": allocated,
@@ -136,21 +137,26 @@ def load_config(path):
     return OmegaConf.merge(base, OmegaConf.load(path))
 
 
-def main():
+def main(default_config=ROOT / "configs/ssl_toy_3060_12gb.yaml"):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--config", type=Path, default=ROOT / "configs/ssl_toy_3060_12gb.yaml")
+    ap.add_argument("--config", type=Path, default=default_config)
     ap.add_argument("--run-dir", type=Path, required=True)
-    ap.add_argument("--steps", type=int, default=1200, help="absolute final optimizer step")
+    ap.add_argument("--steps", type=int, help="absolute final optimizer step (default: configuration)")
     ap.add_argument("--warmup", type=int, default=0)
     ap.add_argument("--resume", type=Path)
     ap.add_argument("--dataset", type=Path)
     ap.add_argument("--no-holdout", action="store_true")
+    ap.add_argument("--batch-size", type=int)
+    ap.add_argument("--benchmark", action="store_true", help="disposable training timing; no checkpoint output")
     args = ap.parse_args()
     os.chdir(ROOT)
     args.run_dir = args.run_dir.resolve()
     args.run_dir.mkdir(parents=True, exist_ok=False)
     cfg = load_config(args.config)
-    cfg.trainer.max_steps = args.steps
+    if args.steps is not None:
+        cfg.trainer.max_steps = args.steps
+    if args.batch_size:
+        cfg.data.batch_size = args.batch_size
     if args.dataset:
         cfg.dataset.path = str(args.dataset.resolve() / "train.lance")
         cfg.dataset.episodes_path = str(args.dataset.resolve() / "train.episodes.npz")
@@ -167,6 +173,12 @@ def main():
     sha = subprocess.check_output(["git", "-C", str(UPSTREAM), "rev-parse", "HEAD"], text=True).strip()
     (args.run_dir / "upstream_sha.txt").write_text(sha+"\n")
     episodes = Episodes([OmegaConf.to_container(cfg.dataset)])
+    import lance
+    metadata = lance.dataset(cfg.dataset.path).schema.metadata or {}
+    if b"toy_ssl" in metadata:
+        raise RuntimeError("Toy training is retired after successful infrastructure validation; use simulator data")
+    if cfg.get("dataset_kind_expected"):
+        assert json.loads(metadata[b"ssl_dataset"])["dataset_kind"] == cfg.dataset_kind_expected
     dataset = WindowedLanceDataset([s["path"] for s in episodes.sources], episodes.offsets,
                                    cfg.data.height, cfg.data.width, cfg.dataset.column)
     holdout = cfg.holdout
@@ -178,7 +190,20 @@ def main():
                          num_workers=cfg.data.num_workers, pin_memory=cfg.data.num_workers > 0,
                          persistent_workers=cfg.data.persistent_workers,
                          multiprocessing_context="forkserver" if cfg.data.num_workers else None)
-    if holdout:
+    external_validation = cfg.get("validation_dataset") if not args.benchmark else None
+    if external_validation:
+        assert holdout is None, "Use separate validation store, not internal holdout"
+        val_episodes = Episodes([OmegaConf.to_container(external_validation)])
+        val_dataset = WindowedLanceDataset([s["path"] for s in val_episodes.sources], val_episodes.offsets,
+                                          cfg.data.height, cfg.data.width, external_validation.column)
+        assert Path(episodes.sources[0]["path"]).resolve() != Path(val_episodes.sources[0]["path"]).resolve()
+        train_ids = set(np.load(cfg.dataset.episodes_path)["episode_idx"].tolist())
+        val_ids = set(np.load(external_validation.episodes_path)["episode_idx"].tolist())
+        assert train_ids.isdisjoint(val_ids), "Train/validation episode leakage"
+        val_loader = torch.utils.data.DataLoader(CachedBatches(val_dataset), collate_fn=identity_collate,
+            num_workers=0, batch_sampler=holdout_batches(val_episodes,np.arange(len(val_episodes.starts)),16,4,0,1))
+        data = spt.data.DataModule(train=loader,val=val_loader)
+    elif holdout:
         val_loader = torch.utils.data.DataLoader(CachedBatches(copy.copy(dataset)),
                          collate_fn=identity_collate, num_workers=0,
                          batch_sampler=holdout_batches(episodes, held, 16, cfg.data.batch_size, 0, 1))
@@ -197,14 +222,18 @@ def main():
               "keep_global": module.keep_global, "keep_local": module.keep_local,
               "upstream_sha": sha}
     (args.run_dir / "model.json").write_text(json.dumps(params, indent=2))
+    if not args.benchmark:
+        torch.save(module.encoder.state_dict(), args.run_dir / "initial_encoder.pt")
     monitor = Measurements(args.run_dir, args.warmup)
     checkpoint = ModelCheckpoint(dirpath=args.run_dir / "checkpoints", filename="step-{step:06d}",
                                  auto_insert_metric_name=False,
-                                 **OmegaConf.to_container(cfg.checkpoint))
+                                 **OmegaConf.to_container(cfg.checkpoint)) if not args.benchmark else None
     trainer = pl.Trainer(**cfg.trainer, default_root_dir=str(args.run_dir),
                          logger=CSVLogger(str(args.run_dir), name="csv"),
-                         callbacks=[monitor, checkpoint],
-                         **({"val_check_interval": holdout.every_n_steps} if holdout else {}))
+                         callbacks=[monitor, checkpoint] if checkpoint else [monitor],
+                         enable_checkpointing=not args.benchmark,
+                         **({"val_check_interval": cfg.validation_every_n_steps} if external_validation else
+                            {"val_check_interval": holdout.every_n_steps} if holdout else {}))
     trainer.gradient_clip_val_ = float(cfg.gradient_clip_val)
     trainer.gradient_clip_algorithm_ = "norm"
     status = "error"
@@ -213,8 +242,9 @@ def main():
         # so a new run never writes into a pre-existing checkpoint's directory.
         trainer.fit(module, datamodule=data,
                     ckpt_path=str(args.resume.resolve()) if args.resume else None, weights_only=False)
-        trainer.save_checkpoint(args.run_dir / "checkpoints/final.ckpt")
-        status = "reached_steps" if trainer.global_step >= args.steps else "time_or_interrupt"
+        if not args.benchmark:
+            trainer.save_checkpoint(args.run_dir / "checkpoints/final.ckpt")
+        status = "reached_steps" if trainer.global_step >= cfg.trainer.max_steps else "time_or_interrupt"
     finally:
         if hasattr(monitor, "started"):
             monitor.summarize(trainer, status)

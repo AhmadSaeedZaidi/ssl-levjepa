@@ -1,7 +1,7 @@
 [project]
 name = "ssl-levjepa"
 version = "0.1.0"
-description = "Local toy-video bootstrap for the pinned upstream LeVJEPA pipeline"
+description = "SSL simulator video datasets and reproducible baselines with pinned upstream LeVJEPA"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "torch>=2.11.0",
@@ -21,6 +21,11 @@ dependencies = [
     "torchmetrics>=1.0",
     "wandb>=0.19",
     "matplotlib>=3.9.0",
+]
+
+[project.optional-dependencies]
+simulation = [
+    "grpcio-tools>=1.85.1",
 ]
 
 [tool.uv]

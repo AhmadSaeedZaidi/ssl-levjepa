@@ -1,14 +1,14 @@
 # SSL × LeVJEPA
 
-A local RTX 3060 12 GB pipeline bootstrap for future motion-aware RoboCup Small Size League video representation experiments.
+A local RTX 3060 12 GB pipeline for RoboCup Small Size League simulator video datasets and representation-learning baselines.
 
-**Toy data only; no empirical research conclusion yet.** The CPU renderer produces simplified moving discs, not SSL simulation or real gameplay. Training loss on this dataset cannot validate the research hypothesis.
+The completed 1,200-step hand-written toy run is successful infrastructure validation. Toy training is now retired; the runner rejects stores tagged as toy data. The native SSL simulator pilot below is the active experiment. Neither pilot establishes a publication-level research conclusion.
 
 The official [LeVJEPA](https://github.com/MLO-lab/LeVJEPA) checkout is a Git submodule pinned to `a748e0fbaa0ec548cad283978b818779708a3bd7`. Its v2 encoder, Lance loader, augmentations, invariance + SIGReg loss, optimizer factory and scheduler are used without source changes. The wrapper adds measurements and isolated checkpoint output. Lightning is called directly because upstream Manager can otherwise add a saver in the directory of a resume input.
 
-## Run locally
+## Historical infrastructure setup
 
-Linux/WSL2, NVIDIA CUDA GPU, Python 3.12, Git, curl and tmux are required. All Python dependencies and uv stay inside this project. No global Python or CUDA changes are needed.
+Linux/WSL2, NVIDIA CUDA GPU, Python 3.12, Git, curl and tmux are required. All Python dependencies and uv stay inside this project. No global Python or CUDA changes are needed. These were the original bootstrap commands; use the native simulator workflow below for new experiments.
 
 ```bash
 git clone --recurse-submodules https://github.com/AhmadSaeedZaidi/ssl-levjepa.git
@@ -40,3 +40,21 @@ tmux attach -t ssl-levjepa
 Resume restores model, optimizer, scheduler and step count. Upstream's sampler has no saved mid-epoch cursor, so resumed sample order is not bitwise identical to uninterrupted training. Throughput is measured end to end after warmup, with CUDA synchronization, separately logged blocking input wait and training compute. No throughput numbers are claimed here before local measurements.
 
 The next experiment should use actual, reproducible SSL gameplay trajectories rendered to RGB, separate state labels and held-out match splits. Establish uniform retention before comparing motion-guided retention at the same token count.
+
+## Native SSL simulator pilot
+
+The completed toy run is retained as infrastructure validation. Further experiments use actual Sumatra 2025 native simulator states and both built-in AIs. A Java adapter uses blocking 10 ms steps, records robot/ball state and selected applied actions, and initializes varied scenario snapshots. Physics is provided by Sumatra's idealized native models; this is not Bullet/ODE or real camera footage. Upstream source remains unmodified.
+
+```bash
+bash scripts/setup_ssl_simulation.sh
+bash scripts/generate_pilot.sh
+bash scripts/run_ssl_experiment.sh
+```
+
+The pinned public release and source hashes are in `simulation/sources.json`. The pilot uses 72 episodes across 12 independent sessions, with an 8/2/2 session split. Raw state/action streams are recorded at 100 Hz and sampled near 15 FPS. The deterministic CPU renderer creates 256px Lance stores and separate 16-frame downstream-label manifests. The ball uses a documented 1.5px minimum display radius. Frame bytes, timestamps, labels, split overlap and duplicate clips are audited before training.
+
+Java 21 with the `jdk.compiler` module is required for the adapter; compilation uses the released Sumatra JARs without a Gradle build. Simulator downloads, generated configuration and classes stay under `.sim/`.
+
+The experiment benchmarks batches 8/16/32/64 with 20 warmup + 100 timed optimizer steps, chooses the fastest size with memory headroom, then trains a fresh 300-step uniform-retention baseline. A frozen readout/Ridge probe predicts ball vx/vy, compared with the exact random encoder initialization and a training-label mean control. Scaling and probe fitting use training clips only; validation selects regularization; test sessions remain held out.
+
+Fixed archived trajectories render reproducibly. Repeating a native AI rollout with the same initialization seed is **not bitwise reproducible**: not all AI/game-controller randomness is controlled. The local `DATASET_REPORT.md` and `BASELINE_REPORT.md` record this limitation, measured results and provenance. These reports and all experiment data/logs/checkpoints remain Git-ignored. The pilot is not sufficient evidence of real-world transfer or a research improvement.

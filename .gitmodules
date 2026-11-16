@@ -1,0 +1,3 @@
+[submodule "upstream/LeVJEPA"]
+	path = upstream/LeVJEPA
+	url = https://github.com/MLO-lab/LeVJEPA.git

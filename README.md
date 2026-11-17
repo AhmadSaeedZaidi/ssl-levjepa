@@ -94,6 +94,16 @@ The full `run` command writes dataset references and reports automatically. Use 
 
 ## Existing pilot
 
+The expanded baseline has a separate fixed protocol: 80 native Sumatra sessions, 1,600 episodes and 12,800 non-overlapping clips, with 10,240 training clips. Its 30 FPS sampling gives each 16-frame clip about half a second of context. Session splits are committed to the local protocol before recording; archived state streams are compressed and hashed.
+
+```bash
+ssl-levjepa dataset expand --output outputs/datasets/sumatra_baseline_v2
+ssl-levjepa baseline-v2 --output outputs/NEW_DATED_FOLDER --plan
+ssl-levjepa baseline-v2 --output outputs/NEW_DATED_FOLDER
+```
+
+This workflow trains three fresh seeds at batch 64 with uniform 90% token dropping, then compares paired random initializations and a supervised RGB CNN through identical frozen readout/spatial probes. It saves regime/session metrics, predictions, measured GPU cost, collapse/crop/temporal/resolution diagnostics and `reports/BASELINE_V2_REPORT.md`. Child stages use a source snapshot so edits to the working tree cannot change a running study. Model checkpoints, labels, scientific reports and large feature caches remain local. The full patch cache is regenerable and removed after successful probes; fitted heads and compact features are retained. No motion-aware retention is implemented.
+
 The completed 1,200-step toy run is successful infrastructure validation and is archived. Further toy training is rejected. The active pilot contains 72 short AI-vs-AI episodes across 12 JVM sessions, split 8/2/2 sessions into train/validation/test. The deterministic renderer produces 576 non-overlapping 16-frame RGB clips. Simulator ground truth is kept separately for downstream labels.
 
 The existing experiment measured batches 8/16/32/64, then trained a fresh 300-step uniform-retention baseline and evaluated frozen ball-velocity features against saved random-encoder and constant controls. Actual measurements and limitations are in the local experiment's `reports/`; the restructure preserves the original evidence under `provenance/`.

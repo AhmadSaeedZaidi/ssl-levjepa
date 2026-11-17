@@ -132,15 +132,18 @@ def _compile() -> None:
 
 
 def _record_one(output: Path, match_index: int, episodes: int, samples: int,
-                seed: int, timeout: int = 180, log_stream=None) -> None:
+                seed: int, timeout: int = 180, log_stream=None, expanded=False, fps=15, compile=True) -> None:
     output = output.expanduser().resolve()
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
-    _compile()
+    if compile:
+        _compile()
     classpath = os.pathsep.join([str(JAVA_CLASSES), str(SUMATRA_RUNTIME / "lib" / "*")])
     command = ["java", "-Xmx3g", "-cp", classpath, "SumatraRecorder", str(output),
                str(match_index), str(episodes), str(samples), str(seed)]
+    if expanded:
+        command.extend(["v2", str(fps)])
     process = subprocess.Popen(command, cwd=SUMATRA_RUNTIME, stdout=log_stream,
                                stderr=subprocess.STDOUT if log_stream is not None else None)
     try:

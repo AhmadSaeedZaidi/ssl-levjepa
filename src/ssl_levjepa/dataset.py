@@ -75,6 +75,8 @@ def digest(path):
 def build(dataset: Path):
     """Render recorded trajectories into fresh derived Lance stores."""
     dataset=resolve_path(dataset)
+    if (dataset/"protocol.json").exists():
+        return render_expanded(dataset)
     if not dataset.is_dir() or not (dataset/"trajectories").is_dir():
         raise FileNotFoundError(f"Expected an existing trajectory folder: {dataset}")
     derived=[dataset/name for name in ("train","validation","test","clips.jsonl","metadata.json","previews")]
@@ -193,6 +195,8 @@ def build(dataset: Path):
 def audit(dataset: Path, output: Path | None = None) -> dict:
     """Audit stored dataset integrity without writing unless output is explicit."""
     dataset=resolve_path(dataset)
+    if (dataset/"protocol.json").exists():
+        return audit_expanded(dataset, output)
     if output is not None:
         output=resolve_path(output)
         if output.exists():
@@ -252,6 +256,302 @@ def audit(dataset: Path, output: Path | None = None) -> dict:
         output=Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result,indent=2)+"\n")
+    return result
+
+
+def _recorded_rows(path):
+    import gzip
+    opener = gzip.open if path.name.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as stream:
+        for line in stream:
+            yield json.loads(line)
+
+
+def expand(dataset: Path):
+    """Record a preregistered 10,240-training-clip cohort, with resumable session boundaries."""
+    from datetime import datetime, timezone
+    import random
+    import shutil
+    import time
+    from . import simulator
+    from .experiment import write_json
+    dataset = resolve_path(dataset)
+    dataset.mkdir(parents=True, exist_ok=True)
+    protocol_path = dataset/"protocol.json"
+    if not protocol_path.exists():
+        if any(dataset.iterdir()):
+            raise FileExistsError(f"Nonempty destination without a protocol: {dataset}")
+        order = list(range(80))
+        random.Random(20261117).shuffle(order)
+        split_sessions = {"train": sorted(order[:64]), "validation": sorted(order[64:72]), "test": sorted(order[72:])}
+        write_json(protocol_path, {
+            "version": 2, "created_at": datetime.now(timezone.utc).isoformat(), "base_seed": 20261117,
+            "sessions": 80, "episodes_per_session": 20, "frames_per_episode": 128, "fps": 30,
+            "clip_length": 16, "clip_stride": 16, "split_sessions": split_sessions,
+            "scenario_families": ["kick", "interception", "pursuit", "passing", "collision"],
+            "scenario_interpretation": "Randomized starting affordances; both native AIs decide all subsequent actions. A passing start does not guarantee a completed pass.",
+            "regimes_mps": {"stationary": [0, .05], "slow": [.05, .5], "moving": [.5, 2], "fast": [2, None]},
+            "heldout_policy": "Session assignments fixed before recording. Existing pilot validation/test remain untouched and excluded from this cohort.",
+            "recorder_sha256": digest(simulator.JAVA_SOURCE),
+        })
+    protocol = json.loads(protocol_path.read_text())
+    assert protocol["version"] == 2 and digest(simulator.JAVA_SOURCE) == protocol["recorder_sha256"]
+    trajectories = dataset/"trajectories"
+    trajectories.mkdir(exist_ok=True)
+    logs = dataset/"logs"
+    logs.mkdir(exist_ok=True)
+    recording = dataset/"recording.json"
+    completed = json.loads(recording.read_text()) if recording.exists() else {}
+    simulator._compile()
+    for session in range(protocol["sessions"]):
+        name = f"v2_session_{session:03d}"
+        path = trajectories/(name+".jsonl.gz")
+        if name in completed:
+            assert path.exists() and digest(path) == completed[name]["sha256"]
+            continue
+        if path.exists():
+            raise FileExistsError(f"Incomplete session preserved; inspect it before resuming: {path}")
+        if shutil.disk_usage(dataset).free < 6*1024**3:
+            raise RuntimeError("Less than 6 GiB free; completed sessions preserved")
+        started = time.perf_counter()
+        with (logs/(name+".log")).open("x") as log:
+            simulator._record_one(path, session, protocol["episodes_per_session"], protocol["frames_per_episode"],
+                                  protocol["base_seed"], timeout=600, log_stream=log,
+                                  expanded=True, fps=protocol["fps"], compile=False)
+        completed[name] = {"sha256": digest(path), "bytes": path.stat().st_size, "wall_sec": time.perf_counter()-started}
+        write_json(recording, completed)
+        print(f"Recorded {session+1}/{protocol['sessions']} sessions: {completed[name]['wall_sec']:.1f}s, {path.stat().st_size/1e6:.1f} MB compressed", flush=True)
+    replay = dataset/"replay_check"
+    replay.mkdir(exist_ok=True)
+    if not (replay/"completed.json").exists():
+        with (logs/"replay.log").open("x") as log:
+            simulator._record_one(replay/"v2_session_000.jsonl.gz", 0, 1, protocol["frames_per_episode"],
+                                  protocol["base_seed"], timeout=180, log_stream=log,
+                                  expanded=True, fps=protocol["fps"], compile=False)
+        write_json(replay/"completed.json", {"sha256": digest(replay/"v2_session_000.jsonl.gz")})
+    if not (dataset/"metadata.json").exists():
+        render_expanded(dataset)
+    if not (dataset/"audit.json").exists():
+        audit_expanded(dataset, dataset/"audit.json")
+    return dataset
+
+
+def render_expanded(dataset: Path):
+    """Stream compressed simulator sessions into the same upstream-compatible Lance schema."""
+    from concurrent.futures import ProcessPoolExecutor
+    from collections import Counter
+    from .experiment import write_json
+    protocol = json.loads((dataset/"protocol.json").read_text())
+    for name in ("train", "validation", "test", "clips.jsonl"):
+        if (dataset/name).exists():
+            raise FileExistsError(f"Derived output exists: {dataset/name}")
+    samples = protocol["frames_per_episode"]
+    metadata = {"version": 2, "dataset_kind": KIND, "render_version": 1, "size": [256,256],
+                "fps_nominal": protocol["fps"], "protocol_sha256": digest(dataset/"protocol.json"),
+                "recorder_sha256": protocol["recorder_sha256"], "split_sessions": protocol["split_sessions"],
+                "trajectory_sha256": {}, "split_counts": {}, "scenario_counts": {},
+                "stats": {"physics_ticks":0, "contact_frames":0, "kick_request_frames":0},
+                "sumatra_source_sha": subprocess.check_output(["git","-C",str(CACHE/"Sumatra"),"rev-parse","HEAD"],text=True).strip(),
+                "sumatra_release_zip_sha256": digest(CACHE/"sumatra.zip"),
+                "runtime_moduli_sha256": digest(CACHE/"sumatra-dist/sumatra/config/moduli/ssl_record.xml")}
+    schema = pa.schema([("episode_idx",pa.int64()),("step_idx",pa.int64()),("timestamp_ns",pa.int64()),
+                        ("frame",pa.binary()),("h",pa.int32()),("w",pa.int32()),("label",pa.int64())],
+                       metadata={"ssl_dataset": json.dumps({"dataset_kind":KIND,"version":2})})
+    index_builder = runpy.run_path(str(UPSTREAM/"scripts/build_episodes.py"))["build"]
+    clips = []
+    previews = []
+    with ProcessPoolExecutor(max_workers=4) as pool:
+        for split, sessions in protocol["split_sessions"].items():
+            folder = dataset/split
+            folder.mkdir()
+            counts = Counter()
+            def batches():
+                start_row = 0
+                for session in sessions:
+                    source = dataset/"trajectories"/f"v2_session_{session:03d}.jsonl.gz"
+                    metadata["trajectory_sha256"][source.name] = digest(source)
+                    rows = []
+                    previous = {}
+                    for row in _recorded_rows(source):
+                        ep = row["episode_id"]
+                        assert row["timestamp_ns"]-previous.get(ep,row["timestamp_ns"]-10_000_000) == 10_000_000
+                        previous[ep] = row["timestamp_ns"]
+                        metadata["stats"]["physics_ticks"] += 1
+                        if row["sample_idx"] >= 0:
+                            rows.append(row)
+                    assert len(rows) == protocol["episodes_per_session"]*samples
+                    for e in range(protocol["episodes_per_session"]):
+                        episode = rows[e*samples:(e+1)*samples]
+                        assert {r["episode_id"] for r in episode} == {session*1_000_000+e}
+                        assert [r["sample_idx"] for r in episode] == list(range(samples))
+                        blobs = list(pool.map(encoded, episode, chunksize=8))
+                        family = episode[0]["scenario_family"]
+                        counts[family] += 1
+                        for r in episode:
+                            assert len(r["robots"]) == 12 and np.isfinite(r["ball"]["position_m"]+r["ball"]["velocity_mps"]).all()
+                            metadata["stats"]["contact_frames"] += int(any(b["ball_contact"] for b in r["robots"]))
+                            metadata["stats"]["kick_request_frames"] += int(any(b["action_applied_last_10ms"]["kick_speed_mps"]>0 for b in r["robots"]))
+                        for start in range(0,samples-15,16):
+                            last, previous_row = episode[start+15], episode[start+14]
+                            x,y,z = last["ball"]["position_m"]
+                            scale = 232/last["field_size_m"][0]
+                            clips.append({"split":split,"episode_id":last["episode_id"],"match_id":last["match_id"],
+                                          "scenario_family":family,"seed":last["seed"],"start_row":start_row+start,"length":16,
+                                          "target_timestamp_ns":last["timestamp_ns"],"target_vxy_mps":last["ball"]["velocity_mps"][:2],
+                                          "target_xy_m":[x,y],"target_image_xy_px":[128+x*scale,128-(y+.15*z)*scale],
+                                          "target_z_m":z,"target_acceleration_mps2":last["ball"]["acceleration_mps2"],
+                                          "dt_last_sec":(last["timestamp_ns"]-previous_row["timestamp_ns"])/1e9,
+                                          "visible_frames":sum(visible(r) for r in episode[start:start+16]),
+                                          "visible_last_two":all(visible(r) for r in episode[start+14:start+16]),
+                                          "rgb_sha256":hashlib.sha256(b"".join(blobs[start:start+16])).hexdigest()})
+                        if len(previews)<5 and family not in [r["scenario_family"] for r in previews]:
+                            previews.append(episode[0])
+                        yield pa.RecordBatch.from_arrays([pa.array([r["episode_id"] for r in episode],type=pa.int64()),
+                              pa.array(range(samples),type=pa.int64()),pa.array([r["timestamp_ns"] for r in episode],type=pa.int64()),
+                              pa.array(blobs,type=pa.binary()),pa.array([256]*samples,type=pa.int32()),pa.array([256]*samples,type=pa.int32()),
+                              pa.array([-1]*samples,type=pa.int64())],schema=schema)
+                        start_row += samples
+                    print(f"Rendered {split} session {session}", flush=True)
+            store = folder/"train.lance"
+            lance.write_dataset(pa.RecordBatchReader.from_batches(schema,batches()),str(store),mode="create",max_rows_per_file=16384)
+            index_builder(str(store))
+            n = len(sessions)*protocol["episodes_per_session"]
+            metadata["split_counts"][split] = {"episodes":n,"frames":n*samples,"clips":n*samples//16}
+            metadata["scenario_counts"][split] = dict(counts)
+    (dataset/"clips.jsonl").write_text("".join(json.dumps(c)+"\n" for c in clips))
+    write_json(dataset/"metadata.json", metadata)
+    folder = dataset/"previews"
+    folder.mkdir()
+    sheet = Image.new("RGB",(256*5,280))
+    draw = ImageDraw.Draw(sheet)
+    for i,row in enumerate(previews):
+        sheet.paste(render(row),(i*256,0)); draw.text((i*256+8,260),row["scenario_family"],fill="white")
+    sheet.save(folder/"scenarios.png")
+    return metadata
+
+
+def audit_expanded(dataset: Path, output: Path | None = None):
+    """Audit all recorded targets, immutable split assignments and rendered clip hashes."""
+    from collections import Counter
+    from .experiment import write_json
+    dataset = resolve_path(dataset)
+    output = resolve_path(output) if output is not None else None
+    if output is not None and output.exists():
+        raise FileExistsError(output)
+    protocol = json.loads((dataset/"protocol.json").read_text())
+    meta = json.loads((dataset/"metadata.json").read_text())
+    assert digest(dataset/"protocol.json") == meta["protocol_sha256"]
+    clips = [json.loads(line) for line in (dataset/"clips.jsonl").read_text().splitlines()]
+    samples = {}; first_states = {}; ticks = 0
+    for filename, checksum in meta["trajectory_sha256"].items():
+        source = dataset/"trajectories"/filename
+        assert digest(source) == checksum
+        previous = {}
+        for row in _recorded_rows(source):
+            ep = row["episode_id"]
+            assert row["timestamp_ns"]-previous.get(ep,row["timestamp_ns"]-10_000_000) == 10_000_000
+            previous[ep] = row["timestamp_ns"]
+            assert len(row["robots"]) == 12
+            ticks += 1
+            if row["sample_idx"] >= 0:
+                samples[(ep,row["sample_idx"])] = (row["timestamp_ns"],row["ball"])
+                if row["sample_idx"] == 0:
+                    first_states[ep] = hashlib.sha256(json.dumps({"ball":row["ball"],"robots":[[b["team"],b["id"],b["pose_m_rad"]] for b in row["robots"]]},sort_keys=True).encode()).hexdigest()
+    stores = {s:lance.dataset(str(dataset/s/"train.lance")) for s in protocol["split_sessions"]}
+    episodes = {s:set() for s in stores}; sessions = {s:set() for s in stores}; seeds = {s:set() for s in stores}
+    hashes = {}; duplicates = 0; render_checks = 0
+    for clip in clips:
+        split = clip["split"]
+        values = stores[split].take(list(range(clip["start_row"],clip["start_row"]+16))).to_pydict()
+        assert set(values["episode_idx"]) == {clip["episode_id"]} and np.all(np.diff(values["step_idx"])==1)
+        assert set(values["label"]) == {-1}
+        source_t,ball = samples[(clip["episode_id"],values["step_idx"][-1])]
+        assert source_t == clip["target_timestamp_ns"] == values["timestamp_ns"][-1]
+        assert ball["velocity_mps"][:2] == clip["target_vxy_mps"] and ball["position_m"][:2] == clip["target_xy_m"]
+        assert hashlib.sha256(b"".join(values["frame"])).hexdigest() == clip["rgb_sha256"]
+        assert clip["match_id"] == f"v2_session_{clip['episode_id']//1_000_000:03d}"
+        assert clip["episode_id"]//1_000_000 in protocol["split_sessions"][split]
+        if clip["rgb_sha256"] in hashes:
+            duplicates += 1
+            assert hashes[clip["rgb_sha256"]] == split, "Cross-split duplicate RGB"
+        hashes[clip["rgb_sha256"]] = split
+        episodes[split].add(clip["episode_id"]); sessions[split].add(clip["match_id"]); seeds[split].add(clip["seed"])
+        if values["step_idx"][0] == 0:
+            raw_ball = samples[(clip["episode_id"],0)][1]
+            # Reconstruct only the checks from source records below; never synthesize dynamics.
+            assert np.isfinite(raw_ball["position_m"]).all()
+    for a,b in [("train","validation"),("train","test"),("validation","test")]:
+        assert episodes[a].isdisjoint(episodes[b]) and sessions[a].isdisjoint(sessions[b]) and seeds[a].isdisjoint(seeds[b])
+    state_duplicates = len(first_states)-len(set(first_states.values()))
+    assert state_duplicates == 0, "Repeated initialization state"
+    replay = list(_recorded_rows(dataset/"replay_check/v2_session_000.jsonl.gz"))
+    reference = []
+    for row in _recorded_rows(dataset/"trajectories/v2_session_000.jsonl.gz"):
+        if row["episode_id"] != 0:
+            break
+        reference.append(row)
+    assert len(replay) == len(reference)
+    differences = [i for i,(a,b) in enumerate(zip(reference,replay)) if a != b]
+    delta = np.array([a["ball"]["position_m"] for a in reference])-np.array([b["ball"]["position_m"] for b in replay])
+    distribution = {}
+    for split in stores:
+        group = [c for c in clips if c["split"] == split]
+        speed = np.linalg.norm([c["target_vxy_mps"] for c in group],axis=1)
+        distribution[split] = {"clips":len(group),"sessions":len(sessions[split]),"episodes":len(episodes[split]),
+                               "speed_quantiles_mps":np.quantile(speed,[0,.1,.25,.5,.75,.9,.99,1]).tolist(),
+                               "stationary":int((speed<.05).sum()),"slow":int(((speed>=.05)&(speed<.5)).sum()),
+                               "moving":int(((speed>=.5)&(speed<2)).sum()),"fast":int((speed>=2).sum()),
+                               "scenarios":dict(Counter(c["scenario_family"] for c in group)),
+                               "visible_clips":sum(c["visible_frames"]==16 for c in group)}
+    result = {"passed":True,"physics_ticks":ticks,"rgb_frames":len(samples),"clips_checked":len(clips),
+              "split_counts_and_motion":distribution,"cross_split_episode_session_seed_overlap":0,
+              "cross_split_duplicate_rgb":0,"within_split_duplicate_rgb":duplicates,"duplicate_initial_states":state_duplicates,
+              "rollout_repeat":{"compared_ticks":len(replay),"identical":not differences,
+                                "first_different_tick":differences[0]+1 if differences else None,
+                                "max_ball_position_difference_m":float(np.linalg.norm(delta,axis=1).max())}}
+    if output is not None:
+        output.parent.mkdir(parents=True,exist_ok=True)
+        write_json(output,result)
+    return result
+
+
+def initialization_diagnostics(dataset: Path, output: Path):
+    """Measure initialization clustering from archived first states, without rerunning simulation."""
+    import gzip
+    from .experiment import write_json
+    dataset,output = resolve_path(dataset),resolve_path(output)
+    if output.exists():
+        raise FileExistsError(output)
+    sessions = []; seeds = []; minimum_robot_distance = []
+    for path in sorted((dataset/"trajectories").glob("*.jsonl.gz")):
+        starts = []
+        with gzip.open(path,"rb") as stream:
+            for line in stream:
+                if b'"sample_idx":0,' not in line:
+                    continue
+                row = json.loads(line)
+                starts.append(row["ball"]["position_m"][:2]); seeds.append(row["seed"])
+                xy = np.array([r["pose_m_rad"][:2] for r in row["robots"]])
+                distances = np.linalg.norm(xy[:,None]-xy[None,:],axis=-1)
+                np.fill_diagonal(distances,np.inf)
+                minimum_robot_distance.append(float(distances.min()))
+        assert len(starts)==20
+        sessions.append(starts)
+    values = np.array(sessions)
+    n,k,_ = values.shape
+    mean = values.mean(1)
+    within = ((values-mean[:,None])**2).sum((0,1))/(n*(k-1))
+    between = k*((mean-mean.mean(0))**2).sum(0)/(n-1)
+    icc = (between-within)/(between+(k-1)*within)
+    result = {"sessions":n,"episodes":n*k,"unique_initialization_seeds":len(set(seeds)),
+              "mean_within_session_ball_xy_std_m":values.std(1,ddof=1).mean(0).tolist(),
+              "between_session_mean_ball_xy_std_m":mean.std(0,ddof=1).tolist(),
+              "one_way_random_effects_icc_xy":icc.tolist(),
+              "ball_start_xy_min_m":values.reshape(-1,2).min(0).tolist(),
+              "ball_start_xy_max_m":values.reshape(-1,2).max(0).tolist(),
+              "minimum_robot_center_separation_first_tick_m":min(minimum_robot_distance),
+              "interpretation":"Unique fresh snapshots do not imply statistically independent coordinates. Sequential java.util.Random seeds may correlate early draws. Session-level splitting/uncertainty handles clustering; mix per-episode seeds before a future cohort. Measurements use actual first recorded states, not generated trajectories."}
+    output.parent.mkdir(parents=True,exist_ok=True);write_json(output,result)
     return result
 
 

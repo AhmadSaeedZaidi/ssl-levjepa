@@ -68,6 +68,20 @@ class MigrationTests(unittest.TestCase):
             evaluation.evaluate(self.root / "missing", self.root / "missing", evidence)
         self.assertEqual(evidence.read_text(), "preserve me")
 
+    def test_info_resolves_each_seed_checkpoint_in_a_v2_bundle(self):
+        bundle = self.root/"outputs/expanded"
+        bundle.mkdir()
+        (bundle/"dataset.json").write_text(json.dumps({"path":"../datasets/pilot"}))
+        (bundle/"protocol.json").write_text(json.dumps({"version":2,"seeds":[42,43,44]}))
+        for seed in (42,43,44):
+            checkpoint = bundle/"seeds"/str(seed)/"training/checkpoints/final.ckpt"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"path test only")
+        result = experiment.info(bundle)
+        self.assertNotIn("checkpoint",result)
+        self.assertEqual(set(result["checkpoints"]),{"42","43","44"})
+        self.assertTrue(all(Path(path).exists() for path in result["checkpoints"].values()))
+
     def test_fresh_source_checkout_is_pinned_before_dirty_check(self):
         from ssl_levjepa import simulator
         calls = []

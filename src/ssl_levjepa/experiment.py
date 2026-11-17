@@ -148,6 +148,18 @@ def info(run=None):
     experiment = resolve_path(run)
     result = {"experiment": str(experiment), "dataset": str(experiment_dataset(experiment)),
               "reports": str(experiment / "reports"), "checkpoint": str(experiment / "training/checkpoints/final.ckpt")}
+    protocol_path = experiment/"protocol.json"
+    if protocol_path.exists():
+        protocol = json.loads(protocol_path.read_text())
+        if protocol.get("version")==2 and "seeds" in protocol:
+            result.pop("checkpoint")
+            result["report"] = str(experiment/"reports/BASELINE_V2_REPORT.md")
+            result["checkpoints"] = {str(seed):str(experiment/"seeds"/str(seed)/"training/checkpoints/final.ckpt") for seed in protocol["seeds"]}
+            result["training"] = {}
+            for seed in protocol["seeds"]:
+                summary_path = experiment/"seeds"/str(seed)/"training/summary.json"
+                if summary_path.exists():
+                    result["training"][str(seed)] = json.loads(summary_path.read_text())
     status = experiment / "status.json"
     if status.exists():
         result["status"] = json.loads(status.read_text())

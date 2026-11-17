@@ -1,46 +1,38 @@
-"""Frozen readout -> linear ball-velocity probe, using only training labels to fit."""
-import argparse
-import hashlib
-import json
-import os
+"""Frozen readout to linear ball-velocity probe."""
 from pathlib import Path
-import sys
-import time
+from .layout import resolve_path, enable_upstream
 
-ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT/"upstream/LeVJEPA"))
-os.environ.setdefault("HF_HUB_OFFLINE","1")
-import lance
-import numpy as np
-from omegaconf import OmegaConf
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_squared_error,mean_absolute_error,r2_score
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
-import torch
-import torch.nn.functional as F
-from data import WindowedLanceDataset
-from model import Encoder
-
-
-def metrics(target,prediction):
-    return {"rmse_mps":float(np.sqrt(mean_squared_error(target,prediction))),
-            "mae_mps":float(mean_absolute_error(target,prediction)),
-            "r2":float(r2_score(target,prediction))}
-
-
-def main():
-    ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--dataset",type=Path,default=ROOT/"data/ssl_sumatra_pilot_v2")
-    ap.add_argument("--run",type=Path,required=True)
-    ap.add_argument("--output",type=Path,required=True)
-    ap.add_argument("--batch-size",type=int,default=2)
-    args=ap.parse_args()
-    args.output.mkdir(parents=True,exist_ok=False)
+def evaluate(dataset: Path, run: Path, output: Path, batch_size: int = 2) -> dict:
+    """Evaluate trained and saved random encoders on the fixed velocity probe."""
+    dataset_root=resolve_path(dataset)
+    run=resolve_path(run)
+    output=resolve_path(output)
+    if output.exists():
+        raise FileExistsError(f"Refusing to overwrite evaluation output: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.mkdir()
+    import hashlib, json, os, time
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    enable_upstream()
+    import lance
+    import numpy as np
+    from omegaconf import OmegaConf
+    from sklearn.linear_model import Ridge
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    import torch
+    import torch.nn.functional as F
+    from data import WindowedLanceDataset
+    from model import Encoder
+    def metrics(target, prediction):
+        return {"rmse_mps":float(np.sqrt(mean_squared_error(target,prediction))),
+                "mae_mps":float(mean_absolute_error(target,prediction)),
+                "r2":float(r2_score(target,prediction))}
     torch.set_num_threads(4); torch.manual_seed(42); np.random.seed(42)
-    cfg=OmegaConf.load(args.run/"config.yaml")
-    checkpoint=torch.load(args.run/"checkpoints/final.ckpt",map_location="cpu",weights_only=False)
-    initial=torch.load(args.run/"initial_encoder.pt",map_location="cpu",weights_only=True)
+    cfg=OmegaConf.load(run/"config.yaml")
+    checkpoint=torch.load(run/"checkpoints/final.ckpt",map_location="cpu",weights_only=False)
+    initial=torch.load(run/"initial_encoder.pt",map_location="cpu",weights_only=True)
     trained={k.removeprefix("encoder."):v for k,v in checkpoint["state_dict"].items() if k.startswith("encoder.")}
     encoders={}
     for name,state in [("random_initialization",initial),("trained",trained)]:
@@ -49,7 +41,7 @@ def main():
         encoders[name]=encoder.cuda().eval().requires_grad_(False)
     mean=torch.tensor([.485,.456,.406],device="cuda").view(1,1,3,1,1)
     std=torch.tensor([.229,.224,.225],device="cuda").view(1,1,3,1,1)
-    candidates=[json.loads(line) for line in (args.dataset/"clips.jsonl").read_text().splitlines()]
+    candidates=[json.loads(line) for line in (dataset_root/"clips.jsonl").read_text().splitlines()]
     clips=[]; excluded={"ball_outside_canvas":0,"duplicate_rgb_clip":0}; seen=set()
     for c in candidates:
         if c["visible_frames"]!=16:
@@ -64,19 +56,19 @@ def main():
     started=time.perf_counter()
     for split in ["train","validation","test"]:
         subset=[c for c in clips if c["split"]==split]
-        store=str(args.dataset/split/"train.lance")
+        store=str(dataset_root/split/"train.lance")
         table=lance.dataset(store)
-        dataset=WindowedLanceDataset([store],[0],256,256)
+        clip_dataset=WindowedLanceDataset([store],[0],256,256)
         assert len(subset)>=16, f"Too few probe clips in {split}"
-        for offset in range(0,len(subset),args.batch_size):
-            group=subset[offset:offset+args.batch_size]
+        for offset in range(0,len(subset),batch_size):
+            group=subset[offset:offset+batch_size]
             indices=np.array([np.arange(c["start_row"],c["start_row"]+16) for c in group])
             # Target is strictly the last input timestamp, never read as an encoder input channel.
             for c,rows in zip(group,indices):
                 keys=table.take(rows.tolist(),columns=["episode_idx","timestamp_ns","label"]).to_pydict()
                 assert set(keys["episode_idx"])=={c["episode_id"]} and keys["timestamp_ns"][-1]==c["target_timestamp_ns"]
                 assert set(keys["label"])=={-1}
-            clip=dataset.__getitems__(indices)["clip"].cuda().permute(0,1,4,2,3).float()/255
+            clip=clip_dataset.__getitems__(indices)["clip"].cuda().permute(0,1,4,2,3).float()/255
             b,t,ch,h,w=clip.shape
             clip=F.interpolate(clip.reshape(b*t,ch,h,w),size=(224,224),mode="bilinear",align_corners=False,antialias=True).reshape(b,t,ch,224,224)
             clip=(clip-mean)/std
@@ -116,12 +108,8 @@ def main():
              "validation":metrics(targets[val],prediction[val]),"test":metrics(targets[test],prediction[test]),
              "test_per_session":{session:metrics(targets[sel],prediction[sel]) for session in sorted(sessions["test"])
                for sel in [test & np.array([c["match_id"]==session for c in ordered])]}}
-    np.savez(args.output/"features_and_predictions.npz",targets=targets,**features,**{f"prediction_{k}":v for k,v in predictions.items()},**masks)
-    (args.output/"clips.jsonl").write_text("".join(json.dumps(c)+"\n" for c in ordered))
+    np.savez(output/"features_and_predictions.npz",targets=targets,**features,**{f"prediction_{k}":v for k,v in predictions.items()},**masks)
+    (output/"clips.jsonl").write_text("".join(json.dumps(c)+"\n" for c in ordered))
     result["feature_sha256"]={k:hashlib.sha256(v.tobytes()).hexdigest() for k,v in features.items()}
-    (args.output/"metrics.json").write_text(json.dumps(result,indent=2)+"\n")
-    print(json.dumps(result,indent=2),flush=True)
-
-
-if __name__=="__main__":
-    main()
+    (output/"metrics.json").write_text(json.dumps(result,indent=2)+"\n")
+    return result

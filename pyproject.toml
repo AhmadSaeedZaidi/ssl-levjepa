@@ -1,6 +1,6 @@
 [project]
 name = "ssl-levjepa"
-version = "0.1.0"
+version = "0.2.0"
 description = "SSL simulator video datasets and reproducible baselines with pinned upstream LeVJEPA"
 requires-python = ">=3.12,<3.14"
 dependencies = [
@@ -28,8 +28,18 @@ simulation = [
     "grpcio-tools>=1.85.1",
 ]
 
-[tool.uv]
-package = false
+[project.scripts]
+ssl-levjepa = "ssl_levjepa.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ssl_levjepa"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

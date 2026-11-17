@@ -5,12 +5,12 @@ model: {patch_size: 16, residual_dim: 192, depth: 12, num_heads: 3, attention_wi
 masking: {keep_global: 0.10, keep_local: 0.10, iid: true}
 dataset_kind_expected: SUMATRA_NATIVE_AI_VS_AI_IDEALIZED_PHYSICS_NOT_REAL_RGB
 dataset:
-  path: data/ssl_sumatra_pilot_v2/train/train.lance
-  episodes_path: data/ssl_sumatra_pilot_v2/train/train.episodes.npz
+  path: outputs/datasets/sumatra_pilot_v2/train/train.lance
+  episodes_path: outputs/datasets/sumatra_pilot_v2/train/train.episodes.npz
   column: frame
 validation_dataset:
-  path: data/ssl_sumatra_pilot_v2/validation/train.lance
-  episodes_path: data/ssl_sumatra_pilot_v2/validation/train.episodes.npz
+  path: outputs/datasets/sumatra_pilot_v2/validation/train.lance
+  episodes_path: outputs/datasets/sumatra_pilot_v2/validation/train.episodes.npz
   column: frame
 validation_every_n_steps: 50
 views: {num_local: 4, global_size: 224, local_size: 96}

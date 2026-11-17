@@ -1,6 +1,6 @@
 """Instrument the unmodified upstream data, model, loss and optimizer recipe."""
-import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -9,9 +9,9 @@ import subprocess
 import sys
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
-UPSTREAM = ROOT / "upstream/LeVJEPA"
-sys.path.insert(0, str(UPSTREAM))
+from .layout import DEFAULT_CONFIG, ROOT, UPSTREAM, resolve_path, enable_upstream
+
+enable_upstream()
 os.environ.setdefault("WANDB_MODE", "disabled")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
@@ -127,40 +127,44 @@ class Measurements(pl.Callback):
                    "peak_reserved_bytes": torch.cuda.max_memory_reserved()}
         (self.directory / "summary.json").write_text(json.dumps(summary, indent=2)+"\n")
         print(json.dumps(summary), flush=True)
+        return summary
 
 
-def load_config(path):
+def load_config(path=DEFAULT_CONFIG):
+    path = resolve_path(path)
     base = OmegaConf.load(UPSTREAM / "configs/config.yaml")
     del base["defaults"]
     base.model = OmegaConf.load(UPSTREAM / "configs/model/vitb.yaml")
     base.dataset = OmegaConf.load(UPSTREAM / "configs/dataset/single.yaml")
-    return OmegaConf.merge(base, OmegaConf.load(path))
+    cfg = OmegaConf.merge(base, OmegaConf.load(path))
+    for section in ("dataset", "validation_dataset"):
+        source = cfg.get(section)
+        if source:
+            for key in ("path", "episodes_path"):
+                if source.get(key):
+                    source[key] = str(resolve_path(source[key], base=ROOT))
+    return cfg
 
 
-def main(default_config=ROOT / "configs/ssl_toy_3060_12gb.yaml"):
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--config", type=Path, default=default_config)
-    ap.add_argument("--run-dir", type=Path, required=True)
-    ap.add_argument("--steps", type=int, help="absolute final optimizer step (default: configuration)")
-    ap.add_argument("--warmup", type=int, default=0)
-    ap.add_argument("--resume", type=Path)
-    ap.add_argument("--dataset", type=Path)
-    ap.add_argument("--no-holdout", action="store_true")
-    ap.add_argument("--batch-size", type=int)
-    ap.add_argument("--benchmark", action="store_true", help="disposable training timing; no checkpoint output")
-    args = ap.parse_args()
+def train(config=DEFAULT_CONFIG, output: Path | None = None, steps=None, warmup=0,
+          resume=None, dataset=None, batch_size=None, benchmark=False, no_holdout=False):
+    """Run the upstream training recipe into a fresh stage directory."""
+    if output is None:
+        raise ValueError("output is required")
     os.chdir(ROOT)
-    args.run_dir = args.run_dir.resolve()
-    args.run_dir.mkdir(parents=True, exist_ok=False)
-    cfg = load_config(args.config)
-    if args.steps is not None:
-        cfg.trainer.max_steps = args.steps
-    if args.batch_size:
-        cfg.data.batch_size = args.batch_size
-    if args.dataset:
-        cfg.dataset.path = str(args.dataset.resolve() / "train.lance")
-        cfg.dataset.episodes_path = str(args.dataset.resolve() / "train.episodes.npz")
-    if args.no_holdout:
+    output = resolve_path(output)
+    output.mkdir(parents=True, exist_ok=False)
+    cfg = load_config(config)
+    if steps is not None:
+        cfg.trainer.max_steps = steps
+    if batch_size:
+        cfg.data.batch_size = batch_size
+    if dataset:
+        dataset = resolve_path(dataset)
+        split_dir = dataset.parent if dataset.name.endswith(".lance") else dataset
+        cfg.dataset.path = str(dataset if dataset.name.endswith(".lance") else split_dir / "train.lance")
+        cfg.dataset.episodes_path = str(split_dir / "train.episodes.npz")
+    if no_holdout:
         cfg.holdout = None
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this measured baseline")
@@ -169,9 +173,9 @@ def main(default_config=ROOT / "configs/ssl_toy_3060_12gb.yaml"):
     torch.set_num_threads(4)
     pl.seed_everything(cfg.seed, workers=True)
     print(OmegaConf.to_yaml(cfg), flush=True)
-    OmegaConf.save(cfg, args.run_dir / "config.yaml")
+    OmegaConf.save(cfg, output / "config.yaml")
     sha = subprocess.check_output(["git", "-C", str(UPSTREAM), "rev-parse", "HEAD"], text=True).strip()
-    (args.run_dir / "upstream_sha.txt").write_text(sha+"\n")
+    (output / "upstream_sha.txt").write_text(sha+"\n")
     episodes = Episodes([OmegaConf.to_container(cfg.dataset)])
     import lance
     metadata = lance.dataset(cfg.dataset.path).schema.metadata or {}
@@ -190,7 +194,7 @@ def main(default_config=ROOT / "configs/ssl_toy_3060_12gb.yaml"):
                          num_workers=cfg.data.num_workers, pin_memory=cfg.data.num_workers > 0,
                          persistent_workers=cfg.data.persistent_workers,
                          multiprocessing_context="forkserver" if cfg.data.num_workers else None)
-    external_validation = cfg.get("validation_dataset") if not args.benchmark else None
+    external_validation = cfg.get("validation_dataset") if not benchmark else None
     if external_validation:
         assert holdout is None, "Use separate validation store, not internal holdout"
         val_episodes = Episodes([OmegaConf.to_container(external_validation)])
@@ -221,17 +225,17 @@ def main(default_config=ROOT / "configs/ssl_toy_3060_12gb.yaml"):
               "total_parameters": sum(p.numel() for p in module.parameters()),
               "keep_global": module.keep_global, "keep_local": module.keep_local,
               "upstream_sha": sha}
-    (args.run_dir / "model.json").write_text(json.dumps(params, indent=2))
-    if not args.benchmark:
-        torch.save(module.encoder.state_dict(), args.run_dir / "initial_encoder.pt")
-    monitor = Measurements(args.run_dir, args.warmup)
-    checkpoint = ModelCheckpoint(dirpath=args.run_dir / "checkpoints", filename="step-{step:06d}",
+    (output / "model.json").write_text(json.dumps(params, indent=2))
+    if not benchmark:
+        torch.save(module.encoder.state_dict(), output / "initial_encoder.pt")
+    monitor = Measurements(output, warmup)
+    checkpoint = ModelCheckpoint(dirpath=output / "checkpoints", filename="step-{step:06d}",
                                  auto_insert_metric_name=False,
-                                 **OmegaConf.to_container(cfg.checkpoint)) if not args.benchmark else None
-    trainer = pl.Trainer(**cfg.trainer, default_root_dir=str(args.run_dir),
-                         logger=CSVLogger(str(args.run_dir), name="csv"),
+                                 **OmegaConf.to_container(cfg.checkpoint)) if not benchmark else None
+    trainer = pl.Trainer(**cfg.trainer, default_root_dir=str(output),
+                         logger=CSVLogger(str(output), name="csv"),
                          callbacks=[monitor, checkpoint] if checkpoint else [monitor],
-                         enable_checkpointing=not args.benchmark,
+                         enable_checkpointing=not benchmark,
                          **({"val_check_interval": cfg.validation_every_n_steps} if external_validation else
                             {"val_check_interval": holdout.every_n_steps} if holdout else {}))
     trainer.gradient_clip_val_ = float(cfg.gradient_clip_val)
@@ -241,14 +245,68 @@ def main(default_config=ROOT / "configs/ssl_toy_3060_12gb.yaml"):
         # Manager adds an automatic saver beside a resume input. Use Lightning directly
         # so a new run never writes into a pre-existing checkpoint's directory.
         trainer.fit(module, datamodule=data,
-                    ckpt_path=str(args.resume.resolve()) if args.resume else None, weights_only=False)
-        if not args.benchmark:
-            trainer.save_checkpoint(args.run_dir / "checkpoints/final.ckpt")
+                    ckpt_path=str(resolve_path(resume)) if resume else None, weights_only=False)
+        if not benchmark:
+            trainer.save_checkpoint(output / "checkpoints/final.ckpt")
         status = "reached_steps" if trainer.global_step >= cfg.trainer.max_steps else "time_or_interrupt"
     finally:
         if hasattr(monitor, "started"):
-            monitor.summarize(trainer, status)
+            summary = monitor.summarize(trainer, status)
+    return summary
 
 
-if __name__ == "__main__":
-    main()
+def verify(checkpoint: Path, output: Path | None = None, dataset: Path | None = None) -> dict:
+    """Strictly reload a trusted local checkpoint and infer from one real clip."""
+    if output is not None:
+        output = resolve_path(output)
+        if output.exists():
+            raise FileExistsError(output)
+    checkpoint = resolve_path(checkpoint)
+    cfg_path = checkpoint.parent.parent / "config.yaml"
+    cfg = OmegaConf.load(resolve_path(cfg_path))
+    for section in ("dataset", "validation_dataset"):
+        source = cfg.get(section)
+        if source:
+            for key in ("path", "episodes_path"):
+                if source.get(key):
+                    source[key] = str(resolve_path(source[key], base=ROOT))
+    if dataset is not None:
+        dataset = resolve_path(dataset)
+        split_dir = dataset.parent if dataset.name.endswith(".lance") else dataset
+        cfg.dataset.path = str(dataset if dataset.name.endswith(".lance") else split_dir / "train.lance")
+        cfg.dataset.episodes_path = str(split_dir / "train.episodes.npz")
+    torch.set_num_threads(4)
+    torch.cuda.set_device(0)
+    checkpoint_data = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    encoder = Encoder(**cfg.model)
+    state = {key.removeprefix("encoder."): value for key, value in checkpoint_data["state_dict"].items()
+             if key.startswith("encoder.")}
+    encoder.load_state_dict(state, strict=True)
+    encoder = encoder.cuda().eval()
+    episodes = Episodes([OmegaConf.to_container(cfg.dataset)])
+    rows = episodes.windows(np.array([0]), episodes.starts[:1], 16)
+    dataset_obj = WindowedLanceDataset([cfg.dataset.path], episodes.offsets,
+                                       cfg.data.height, cfg.data.width, cfg.dataset.column)
+    batch = dataset_obj.__getitems__(rows)
+    view_builder = ViewBuilder(**cfg.views).cuda()
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
+        global_view, _ = view_builder(batch["clip"].cuda())
+        readout, _, _ = encoder(global_view, keep_per_frame=20, iid=cfg.masking.iid)
+    assert torch.isfinite(readout).all()
+    steps = [float(state["step"]) for state in checkpoint_data["optimizer_states"][0]["state"].values()
+             if "step" in state]
+    assert min(steps) == max(steps) == checkpoint_data["global_step"]
+    assert checkpoint_data["lr_schedulers"][0]["last_epoch"] == checkpoint_data["global_step"]
+    with checkpoint.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    evidence = {"checkpoint": str(checkpoint), "sha256": digest,
+                "global_step": checkpoint_data["global_step"], "optimizer_state_entries": len(steps),
+                "optimizer_step_min": min(steps), "optimizer_step_max": max(steps),
+                "scheduler_last_epoch": checkpoint_data["lr_schedulers"][0]["last_epoch"],
+                "strict_encoder_reload": True, "inference_shape": list(readout.shape),
+                "inference_finite": True}
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(evidence, indent=2)+"\n")
+    return evidence

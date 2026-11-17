@@ -1,60 +1,107 @@
 # SSL × LeVJEPA
 
-A local RTX 3060 12 GB pipeline for RoboCup Small Size League simulator video datasets and representation-learning baselines.
+RoboCup Small Size League simulator video datasets and LeVJEPA baselines on an RTX 3060 12 GB. Sumatra supplies the simulation and team AIs; Python records experiments, renders video and runs the pinned upstream model.
 
-The completed 1,200-step hand-written toy run is successful infrastructure validation. Toy training is now retired; the runner rejects stores tagged as toy data. The native SSL simulator pilot below is the active experiment. Neither pilot establishes a publication-level research conclusion.
+```text
+ssl-levjepa/
+├── src/ssl_levjepa/           # One Python package and CLI
+│   ├── simulator.py          # Runtime setup and Java recorder integration
+│   ├── dataset.py            # CPU rendering, Lance datasets and validation
+│   ├── training.py           # Upstream recipe, measurements and checkpoint checks
+│   ├── benchmark.py          # Isolated batch-size measurements
+│   ├── evaluation.py         # Frozen-feature ball-velocity probe
+│   ├── reporting.py          # Reports from measured artifacts
+│   ├── experiment.py         # Experiment orchestration and output bundles
+│   ├── layout.py             # Paths, including historical-path resolution
+│   └── cli.py                # All commands below
+├── simulation/
+│   ├── sumatra/java/SumatraRecorder.java
+│   └── sources.json          # Simulator source/release pins
+├── configs/sumatra_pilot.yaml
+├── tests/                   # CLI and migration regression checks
+├── upstream/LeVJEPA/         # Unmodified, pinned Git submodule
+├── outputs/                 # Local only; all scientific artifacts
+│   ├── datasets/sumatra_pilot_v2/
+│   │   ├── trajectories/    # Original simulator state/action recordings
+│   │   ├── train/           # Lance store and episode index
+│   │   ├── validation/
+│   │   ├── test/
+│   │   ├── previews/
+│   │   └── …                # Clip manifest, metadata and audit
+│   ├── 2026-11-16_101113_sumatra_baseline/
+│   │   ├── config.yaml      # Effective configuration
+│   │   ├── dataset.json     # Shared dataset reference and manifest hashes
+│   │   ├── benchmark/
+│   │   ├── training/        # Checkpoints, metrics and saved initialization
+│   │   ├── evaluation/      # Features, predictions and probe metrics
+│   │   ├── logs/
+│   │   ├── reports/         # DATASET_REPORT.md and BASELINE_REPORT.md
+│   │   ├── provenance/      # Verification and original migration evidence
+│   │   └── status.json
+│   ├── archive/             # Preserved toy and simulator-debug artifacts
+│   ├── latest.json
+│   └── migration.json       # Old/new paths and artifact SHA-256 inventory
+├── .cache/                  # Simulator downloads/classes and environment cache
+├── bootstrap.sh             # Environment setup only
+├── pyproject.toml
+└── uv.lock
+```
 
-The official [LeVJEPA](https://github.com/MLO-lab/LeVJEPA) checkout is a Git submodule pinned to `a748e0fbaa0ec548cad283978b818779708a3bd7`. Its v2 encoder, Lance loader, augmentations, invariance + SIGReg loss, optimizer factory and scheduler are used without source changes. The wrapper adds measurements and isolated checkpoint output. Lightning is called directly because upstream Manager can otherwise add a saver in the directory of a resume input.
+Datasets are shared across experiments. Each new experiment gets a dated directory containing its configuration, results, logs and reports. Existing stage outputs are preserved; reruns need a new destination. Historical saved paths resolve through the local migration manifest without editing old configurations or checkpoints. `outputs/`, `.cache/`, `.tools/` and `.venv/` are Git-ignored.
 
-## Historical infrastructure setup
+## Setup
 
-Linux/WSL2, NVIDIA CUDA GPU, Python 3.12, Git, curl and tmux are required. All Python dependencies and uv stay inside this project. No global Python or CUDA changes are needed. These were the original bootstrap commands; use the native simulator workflow below for new experiments.
+Use Linux/WSL2 with Python 3.12, Git, curl, CUDA access and Java 21 including `jdk.compiler`. All commands run from the repository root. Python dependencies and simulator assets stay inside the project.
 
 ```bash
 git clone --recurse-submodules https://github.com/AhmadSaeedZaidi/ssl-levjepa.git
 cd ssl-levjepa
-bash scripts/setup.sh
-bash scripts/inspect.sh
-bash scripts/preflight.sh
-bash scripts/profile_3060.sh
-# Only after all measured gates pass:
-tmux new-session -d -s ssl-levjepa bash scripts/run_overnight.sh
+bash bootstrap.sh
+source .venv/bin/activate
+ssl-levjepa --help
 ```
 
-The preflight builds a 4 × 32 pilot, then 160 × 96 deterministic JPEG RGB frames in Lance with seed 42. It checks upstream decoding, clip boundaries/order and normalized view shapes. The training validation runs one optimizer step, resumes for 50 more, then resumes for 25 warmup + 200 measured steps. The overnight stage resumes to an absolute total of 1,200 steps. Each invocation has an eight-hour wall limit; failures preserve nonzero exit codes. No stage silently restarts or overwrites an existing output directory.
+The Java recorder compiles against the released Sumatra JARs; no Gradle build or source patch is needed. The Python package coordinates the native simulator and uses PyTorch/CUDA for model computation. Simulation dynamics remain in Sumatra.
 
-`configs/ssl_toy_3060_12gb.yaml` configures a 192-wide, 12-block, three-head encoder, 16-frame clips, one 224px global view, four 96px local views, 10% IID token retention, batch 8 and bf16 mixed precision (fp16/scaler fallback if unsupported). The unmodified upstream recipe uses AdamW and invariance + 0.06 × SIGReg. Optional evaluation EMA and compilation are disabled. Sixteen toy episodes are held out.
+## Dataset and experiment commands
 
-## Outputs and resume
-
-`data/`, `runs/`, `logs/`, `preview.png` and `RUN_REPORT.md` are local and Git-ignored. The public repository contains source, configuration, a dependency lock and this README. Checkpoints are saved every 100 optimizer steps; two recent periodic checkpoints plus last/final are retained. JSONL metrics record every step. GPU temperature, utilization and power are sampled every 30 seconds.
+Setup downloads the pinned simulator. Dataset building records new AI-vs-AI trajectories, renders deterministic CPU RGB clips, and audits session splits and label alignment. It refuses an existing dataset destination.
 
 ```bash
-# Use a NEW output directory and an explicit existing checkpoint:
-bash scripts/run_stage.sh runs/resumed_run 1200 --resume runs/previous_run/checkpoints/final.ckpt
-.venv/bin/python tools/verify_checkpoint.py runs/resumed_run/checkpoints/final.ckpt
-.venv/bin/python tools/report.py --run runs/resumed_run
-tmux attach -t ssl-levjepa
+ssl-levjepa simulator setup
+ssl-levjepa dataset build --output outputs/datasets/sumatra_pilot_v2
+ssl-levjepa dataset audit sumatra_pilot_v2
+ssl-levjepa dataset validate outputs/datasets/sumatra_pilot_v2/train
+
+# Inspect stages and paths without writing or running them:
+ssl-levjepa run --dataset sumatra_pilot_v2 --plan
+
+# Start a fresh benchmark + baseline + frozen evaluation in a dated bundle:
+ssl-levjepa run --dataset sumatra_pilot_v2
+ssl-levjepa info
 ```
 
-Resume restores model, optimizer, scheduler and step count. Upstream's sampler has no saved mid-epoch cursor, so resumed sample order is not bitwise identical to uninterrupted training. Throughput is measured end to end after warmup, with CUDA synchronization, separately logged blocking input wait and training compute. No throughput numbers are claimed here before local measurements.
-
-The next experiment should use actual, reproducible SSL gameplay trajectories rendered to RGB, separate state labels and held-out match splits. Establish uniform retention before comparing motion-guided retention at the same token count.
-
-## Native SSL simulator pilot
-
-The completed toy run is retained as infrastructure validation. Further experiments use actual Sumatra 2025 native simulator states and both built-in AIs. A Java adapter uses blocking 10 ms steps, records robot/ball state and selected applied actions, and initializes varied scenario snapshots. Physics is provided by Sumatra's idealized native models; this is not Bullet/ODE or real camera footage. Upstream source remains unmodified.
+Individual stages use the same CLI:
 
 ```bash
-bash scripts/setup_ssl_simulation.sh
-bash scripts/generate_pilot.sh
-bash scripts/run_ssl_experiment.sh
+ssl-levjepa benchmark --dataset sumatra_pilot_v2 --output outputs/batch_comparison/benchmark
+ssl-levjepa train --config configs/sumatra_pilot.yaml --output outputs/my_baseline/training
+ssl-levjepa checkpoint verify outputs/my_baseline/training/checkpoints/final.ckpt
+ssl-levjepa evaluate --dataset sumatra_pilot_v2 --run outputs/my_baseline/training --output outputs/my_baseline/evaluation
 ```
 
-The pinned public release and source hashes are in `simulation/sources.json`. The pilot uses 72 episodes across 12 independent sessions, with an 8/2/2 session split. Raw state/action streams are recorded at 100 Hz and sampled near 15 FPS. The deterministic CPU renderer creates 256px Lance stores and separate 16-frame downstream-label manifests. The ball uses a documented 1.5px minimum display radius. Frame bytes, timestamps, labels, split overlap and duplicate clips are audited before training.
+The full `run` command writes dataset references and reports automatically. Use `report --run <experiment>` to generate reports in a complete bundle; use `--output <new-directory>` to generate another copy. `train --resume <checkpoint>` restores model, optimizer, scheduler and step into a **new** training directory; upstream does not save its mid-epoch sampling cursor, so resumed sample order is not exact. Audit, validation and checkpoint checks write evidence only when `--output` is supplied.
 
-Java 21 with the `jdk.compiler` module is required for the adapter; compilation uses the released Sumatra JARs without a Gradle build. Simulator downloads, generated configuration and classes stay under `.sim/`.
+## Existing pilot
 
-The experiment benchmarks batches 8/16/32/64 with 20 warmup + 100 timed optimizer steps, chooses the fastest size with memory headroom, then trains a fresh 300-step uniform-retention baseline. A frozen readout/Ridge probe predicts ball vx/vy, compared with the exact random encoder initialization and a training-label mean control. Scaling and probe fitting use training clips only; validation selects regularization; test sessions remain held out.
+The completed 1,200-step toy run is successful infrastructure validation and is archived. Further toy training is rejected. The active pilot contains 72 short AI-vs-AI episodes across 12 JVM sessions, split 8/2/2 sessions into train/validation/test. The deterministic renderer produces 576 non-overlapping 16-frame RGB clips. Simulator ground truth is kept separately for downstream labels.
 
-Fixed archived trajectories render reproducibly. Repeating a native AI rollout with the same initialization seed is **not bitwise reproducible**: not all AI/game-controller randomness is controlled. The local `DATASET_REPORT.md` and `BASELINE_REPORT.md` record this limitation, measured results and provenance. These reports and all experiment data/logs/checkpoints remain Git-ignored. The pilot is not sufficient evidence of real-world transfer or a research improvement.
+The existing experiment measured batches 8/16/32/64, then trained a fresh 300-step uniform-retention baseline and evaluated frozen ball-velocity features against saved random-encoder and constant controls. Actual measurements and limitations are in the local experiment's `reports/`; the restructure preserves the original evidence under `provenance/`.
+
+Sumatra's native physics is idealized and the scenarios are short controlled starts, not complete refereed matches or camera footage. Repeating AI rollouts from the same initialization seed is not bitwise deterministic. Archived trajectories and rendered inputs are reproducible. One training seed and two held-out test sessions do not establish a reliable research improvement or real-world transfer.
+
+Upstream [LeVJEPA](https://github.com/MLO-lab/LeVJEPA) remains unmodified at `a748e0fbaa0ec548cad283978b818779708a3bd7`. Its encoder, Lance loader, augmentations, invariance + SIGReg loss, optimizer and scheduler are used directly. No motion-aware token selection is introduced. Lightning is called directly to keep new outputs away from a resume input's directory.
+
+```bash
+python -m unittest discover -s tests -v
+```

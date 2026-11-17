@@ -1,14 +1,8 @@
 .venv/
 .tools/
 .cache/
-data/
-runs/
-logs/
+outputs/
 wandb/
 __pycache__/
 *.py[cod]
-RUN_REPORT.md
-preview.png
-.sim/
-DATASET_REPORT.md
-BASELINE_REPORT.md
+dist/

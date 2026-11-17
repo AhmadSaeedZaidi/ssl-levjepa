@@ -48,6 +48,11 @@ def parser():
     expanded.add_argument("--steps",type=int,default=3000)
     expanded.add_argument("--plan",action="store_true")
 
+    ablations = groups.add_parser("ablate-v2", help="Run matched augmentation and per-frame masking on an existing baseline")
+    ablations.add_argument("--baseline", type=Path, required=True)
+    ablations.add_argument("--output", type=Path, required=True)
+    ablations.add_argument("--plan", action="store_true")
+
     train = groups.add_parser("train", help="Train with the unmodified upstream recipe")
     train.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     train.add_argument("--output", type=Path, required=True, help="New training stage directory")
@@ -148,6 +153,9 @@ def dispatch(argv=None):
     if args.command == "baseline-v2":
         from .experiment import baseline_v2
         return baseline_v2(resolve_path(args.config),dataset_path(args.dataset),resolve_path(args.output),seeds=args.seeds,steps=args.steps,plan=args.plan)
+    if args.command == "ablate-v2":
+        from .ablations import run
+        return run(args.baseline, args.output, args.plan)
     if args.command == "train":
         from .training import train
         return train(config=resolve_path(args.config), output=resolve_path(args.output), steps=args.steps, warmup=args.warmup,

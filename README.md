@@ -106,6 +106,15 @@ This workflow trains three fresh seeds at batch 64 with uniform 90% token droppi
 
 The completed 1,200-step toy run is successful infrastructure validation and is archived. Further toy training is rejected. The original pilot contains 72 short AI-vs-AI episodes across 12 JVM sessions, split 8/2/2 sessions into train/validation/test. The deterministic renderer produces 576 non-overlapping 16-frame RGB clips. Simulator ground truth is kept separately for downstream labels.
 
+After v2, compare the original checkpoints with wider local crops and disabled flips as one intervention, and uniform per-frame masking as a second intervention. Each arm repeats the same three seeds and reuses the fixed cohort, token budget and five frozen probes.
+
+```bash
+ssl-levjepa ablate-v2 --baseline outputs/COMPLETED_V2 --output outputs/NEW_ABLATION --plan
+ssl-levjepa ablate-v2 --baseline outputs/COMPLETED_V2 --output outputs/NEW_ABLATION
+```
+
+The ablation folder holds per-arm configs, checkpoints, validation selections, probe predictions, telemetry and `reports/ABLATION_REPORT.md`. Repeating the command skips stages that completed and archives any interrupted stage before retrying it.
+
 The existing experiment measured batches 8/16/32/64, then trained a fresh 300-step uniform-retention baseline and evaluated frozen ball-velocity features against saved random-encoder and constant controls. Actual measurements and limitations are in the local experiment's `reports/`; the restructure preserves the original evidence under `provenance/`.
 
 Sumatra's native physics is idealized and the scenarios are short controlled starts, not complete refereed matches or camera footage. Repeating AI rollouts from the same initialization seed is not bitwise deterministic. Archived trajectories and rendered inputs are reproducible. One training seed and two held-out test sessions do not establish a reliable research improvement or real-world transfer.

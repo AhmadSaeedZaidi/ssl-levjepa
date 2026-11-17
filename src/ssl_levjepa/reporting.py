@@ -313,6 +313,23 @@ def write_v2(experiment: Path):
     scenario_rows = [f"| {name} | {v['episodes']} | {v['turning_episodes']} | {v['native_kick_timestamps']} | {v['barrier_contact_frames']} | {v['near_robot_turns']} | {v['same_team_contact_transfers']} |" for name,v in diversity["coverage"].items()]
     decision = ("The primary spatial-conv comparison passes the declared consistency rule on this simulated cohort. Proceed to a controlled retention comparison while retaining both controls. This does not establish real-camera transfer."
                 if consistent else "The primary spatial-conv comparison does not pass the declared consistency rule. Isolated winning heads or a favorable seed mean do not establish a reliable pretraining benefit. Keep motion-aware retention deferred and investigate representation/objective alignment before scaling again.")
+    trained_readout = np.mean(values("trained","global_readout_ridge"))
+    trained_spatial = np.mean(values("trained","spatial_conv"))
+    readout_position = np.mean(values("trained","global_readout_ridge","localization_rmse_px"))
+    spatial_position = np.mean(values("trained","spatial_conv","localization_rmse_px"))
+    spatial_summary = (
+        f"Readout Ridge and the convolutional probe give mean localization errors of {readout_position:.2f}px and "
+        f"{spatial_position:.2f}px, respectively. Their velocity errors are {trained_readout:.4f} and "
+        f"{trained_spatial:.4f} m/s. The comparison changes both feature layout and head capacity. "
+        "Readout Ridge versus spatial Ridge gives a same-family comparison."
+    )
+    if spatial_position < readout_position and trained_spatial < trained_readout:
+        spatial_summary += " The gains show that the global readout and its linear probe leave useful spatial information undecoded."
+    regime_summary = []
+    for regime in REGIMES:
+        if detector["test"]["motion"][regime]["n"]:
+            delta = np.mean(values("trained","spatial_conv",regime=regime)) - np.mean(values("random","spatial_conv",regime=regime))
+            regime_summary.append(f"{delta:+.4f} in {regime}")
     initialization = read(experiment/"provenance/initialization_diagnostics.json")
     initialization_text = (f"Additional initialization audit: within-session ball X/Y standard deviations average `{initialization['mean_within_session_ball_xy_std_m']}`m; between-session mean-position standard deviations are `{initialization['between_session_mean_ball_xy_std_m']}`m; one-way coordinate ICC is `{initialization['one_way_random_effects_icc_xy']}`. Sequential Java Random seeds correlate early draws, especially ball X. Fresh snapshots therefore do not imply independent coordinate draws. Session splits and clustered uncertainty are essential; hash/mix episode seeds before a future cohort. No current split or recording was changed."
                            if initialization else "Initialization clustering is controlled by session-level splitting; fresh snapshots are not assumed to be independent statistical samples.")
@@ -348,7 +365,7 @@ Same-seed replay: {audit['rollout_repeat']['compared_ticks']} ticks, identical={
 
 ## Probes, visual controls and leakage checks
 
-All arms use one frozen eligible cohort, SHA256 `{cohort['cohort_sha256']}`. Eligible counts: `{cohort['clips']}`; visibility exclusions: `{cohort['excluded']}`. The saved visibility flag gates downstream clips; pretraining still sees all training clips, including out-of-canvas-ball cases. Neither target values nor simulator state enter an encoder. Probes receive RGB features and observed last-frame interval. Normalization uses training data only; validation selects alpha/epoch; test predictions follow selection. Pretraining uses separate train/validation Lance stores; test never enters the optimizer. Upstream decoding/sampling/view checks are in `provenance/preflight_*.json`.
+All arms use one frozen eligible cohort with SHA256 `{cohort['cohort_sha256']}`. Eligible counts are `{cohort['clips']}`. The visibility filter excluded {sum(cohort['excluded'].values())} clips. Pretraining samples RGB windows from the training Lance store. Downstream probes receive RGB features and the observed last-frame interval. Normalization uses training data only. Validation selects the Ridge penalty or head epoch before test prediction. Pretraining validation uses a separate Lance store. Upstream decoding, sampling and view checks are in `provenance/preflight_*.json`.
 
 1. Learned global readout: 192 values compressing space/time.
 2. Mean patch pooling: average all 16×196 dense outputs to 192 values.
@@ -356,6 +373,8 @@ All arms use one frozen eligible cohort, SHA256 `{cohort['cohort_sha256']}`. Eli
 4. Shared spatial heads use all 192 channels: last-frame features plus timestamp-normalized differences feed a 384→32 pointwise MLP; the conv head adds a 32-channel 3×3 layer. Heatmap/subpatch offsets localize the ball, then velocity is read at the **predicted** cell. Ground-truth cells supervise training only. Patch normalization is fit on training samples only.
 
 Ridge alpha grid `{cohort['ridge_alpha_grid']}`. Spatial heads: AdamW lr .001, weight decay .001, 20 epochs, batch 128, identical probe seed 20261117. Validation selection minimizes joint standardized velocity/localization MSE. The original pilot's initial unnormalized heads remain as exploratory evidence; normalization was fixed before v2 evaluation.
+
+The expanded Ridge fits use float64 for the linear solve. This numerical choice was recorded before the expanded fits, with the same features, penalty grid and selection criterion.
 
 Random controls load each run's exact saved initial encoder. The supervised visual control is a four-stage stride-2 CNN (3→32→64→96→192, GroupNorm/GELU), trained on the last two observed RGB frames with training-only labels, selected on validation, then frozen and passed through the **same five probes**. Its supervised end-to-end predictions are retained too. It demonstrates task availability; it is not an architecture- or temporal-budget-matched supervised ViT. The RGB color/centroid control uses fixed renderer-aware color/scale and timestamps, never ground-truth position as input; it is not a real-camera detector.
 
@@ -385,6 +404,8 @@ Values below are mean ± sample SD across three encoder seeds. Velocity RMSE is 
 |---|---|---:|---:|---:|
 {chr(10).join(comparison_rows)}
 
+{spatial_summary}
+
 RGB centroid/finite difference: **{detector['test']['aggregate']['velocity_rmse_mps']:.4f} m/s** and **{detector['test']['aggregate']['localization_rmse_px']:.3f}px** test RMSE; both-frame detection rate {cohort['detector_both_frames_rate']:.4f} over the full cohort. Finite differences estimate interval-average velocity, so impacts/kicks and vertical height cues can disagree with the instantaneous target.
 
 Primary spatial-conv velocity result by regime:
@@ -392,6 +413,8 @@ Primary spatial-conv velocity result by regime:
 | Regime | Test clips | RGB finite difference | Random | LeVJEPA | Supervised CNN |
 |---|---:|---:|---:|---:|---:|
 {chr(10).join(regime_rows)}
+
+Mean trained-minus-random spatial probe differences in m/s are {", ".join(regime_summary)}. These regime comparisons are descriptive.
 
 Trained-minus-paired-random seed differences: `{paired.tolist()}`. Mean {paired.mean():.6f} m/s; session-cluster bootstrap 95% percentile interval **[{interval[0]:.6f}, {interval[1]:.6f}]**, 2,000 replicates over {len(sessions)} held-out sessions. Negative favors training. The declared consistency rule requires all paired deltas and the interval to be below zero. Bootstrap conditions on these trained seeds and this renderer; eight sessions remain limited.
 
@@ -445,17 +468,25 @@ Expansion resumes only completed hashed sessions; partial files and existing out
 """
     destination.write_text(report,encoding="utf-8")
     fig,axes = plt.subplots(1,2,figsize=(12,4))
-    for arm,color in [("random","#777777"),("trained","#2166ac"),("supervised","#b2182b")]:
+    colors = {"random":"#777777","trained":"#2166ac","supervised":"#b2182b"}
+    labels = {"random":"Random ViT","trained":"LeVJEPA ViT","supervised":"Supervised CNN"}
+    for arm in arms:
         means = [np.mean(values(arm,p)) for p in probes]
         deviations = [np.std(values(arm,p),ddof=1) for p in probes]
         offset = {"random":-.22,"trained":0,"supervised":.22}[arm]
-        axes[0].bar(np.arange(len(probes))+offset,means,.22,yerr=deviations,label=arm,color=color,capsize=2)
+        axes[0].bar(np.arange(len(probes))+offset,means,.22,yerr=deviations,label=labels[arm],color=colors[arm],capsize=2)
     axes[0].set_xticks(np.arange(len(probes)),["Readout","Mean pool","Spatial Ridge","Pointwise","Conv"],rotation=20)
-    axes[0].set_ylabel("Test velocity RMSE (m/s)");axes[0].legend(fontsize=8)
+    axes[0].set_title("Frozen probes across three seeds")
+    axes[0].set_ylabel("Test velocity RMSE (m/s)")
+    axes[0].legend(fontsize=8,loc="upper center",bbox_to_anchor=(0.5,-0.24),ncol=3,frameon=False)
     for arm in arms:
         y = [np.mean(values(arm,"spatial_conv",regime=r)) if detector["test"]["motion"][r]["n"] else np.nan for r in REGIMES]
-        axes[1].plot(list(REGIMES),y,marker="o",label=arm)
-    axes[1].set_ylabel("Spatial-conv RMSE (m/s)");axes[1].legend(fontsize=8)
+        axes[1].plot(list(REGIMES),y,marker="o",label=labels[arm],color=colors[arm])
+    rgb_rmse = [detector["test"]["motion"][regime]["velocity_rmse_mps"] for regime in REGIMES]
+    axes[1].plot(list(REGIMES),rgb_rmse,marker="s",linestyle="--",label="RGB centroid",color="#267653")
+    axes[1].set_title("Velocity error by motion regime")
+    axes[1].set_ylabel("Test velocity RMSE (m/s)")
+    axes[1].legend(fontsize=8,loc="upper center",bbox_to_anchor=(0.5,-0.24),ncol=2,frameon=False)
     fig.tight_layout();fig.savefig(destination.parent/"baseline_v2_metrics.png",dpi=180);plt.close(fig)
     write_json(destination.parent/"summary.json",{"training_gpu_wall_hours":training_hours,"all_measured_gpu_stage_wall_hours":gpu_hours,
                "uncertainty":uncertainty,"report_sha256":checksum(destination)})

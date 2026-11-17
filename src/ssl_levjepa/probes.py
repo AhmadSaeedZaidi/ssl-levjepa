@@ -374,13 +374,15 @@ def fit(probe_data, features, output, remove_patch_cache=False):
     with threadpool_limits(limits=4):
         for name,x in candidates.items():
             destination = output/name; destination.mkdir()
-            x = np.concatenate((x,dt),1)
+            x = np.concatenate((x,dt),1).astype(np.float64)
             best = None; grid = []
             for alpha in (.1,1,10,100,1000,10000):
                 estimator = make_pipeline(StandardScaler(),Ridge(alpha=alpha))
                 estimator.fit(x[masks["train"]],(target[masks["train"]]-ymean)/ystd)
                 pred = estimator.predict(x[masks["validation"]])*ystd+ymean
                 score = float(np.mean(((pred-target[masks["validation"]])/ystd)**2))
+                if not np.isfinite(score):
+                    raise FloatingPointError(f"Non-finite validation score for {name}, alpha={alpha}")
                 grid.append({"alpha":alpha,"validation_standardized_mse":score})
                 if best is None or score<best[0]:
                     best = (score,estimator,alpha)
@@ -469,7 +471,7 @@ def _predict_saved(feature_folder, fitted_folder, original_features, cohort, out
     result = {}
     for name,x in {"global_readout_ridge":global_values["readout"],"mean_patch_pool_ridge":global_values["mean_pool"],"spatial_patch_ridge":spatial}.items():
         probe = joblib.load(fitted_folder/name/"probe.joblib")
-        prediction = probe["estimator"].predict(np.concatenate((x,dt),1))*probe["target_std"]+probe["target_mean"]
+        prediction = probe["estimator"].predict(np.concatenate((x,dt),1).astype(np.float64))*probe["target_std"]+probe["target_mean"]
         result[name] = grouped_metrics(target,prediction,clips)
         np.savez(output/(name+"_predictions.npz"),prediction=prediction)
     for kind in ("pointwise","conv"):
